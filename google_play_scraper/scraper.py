@@ -1,11 +1,12 @@
 """
 Google Play Store Scraper
 """
-import datetime
 import requests
 import json
-import re
 import time
+import os
+from bs4 import BeautifulSoup
+from datetime import datetime
 
 from urllib.parse import quote_plus
 from google_play_scraper.util import PlayStoreException, PlayStoreCollections, WebsiteMappings
@@ -21,6 +22,18 @@ class PlayStoreScraper:
 	can be found at https://github.com/facundoolano/google-play-scraper.
 	"""
 	PLAYSTORE_URL = "https://play.google.com"
+
+	@staticmethod
+	def extract_all_app_ids_from_page(page_source):
+		"""
+		Uses the WebsiteMappings.app_detail_link_subdomain to find any link on
+		a provided page source and returns the app id from that link.
+
+		:param str page_source: Raw page source from request.get()
+		:return List: List of app ids
+		"""
+		soup = BeautifulSoup(page_source, 'html.parser')
+		return [link.get('href').split(WebsiteMappings.app_detail_link_subdomain)[1] for link in soup.find_all('a') if WebsiteMappings.app_detail_link_subdomain in link.get('href')]
 
 	def get_app_ids_for_query(self, term, num=50, page=1, country="nl", lang="nl"):
 		"""
@@ -49,23 +62,72 @@ class PlayStoreScraper:
 
 		try:
 			result = requests.get(url).text
-			data = self.extract_json_block(result, "ds:3")
-			data = json.loads(data)
 		except ConnectionError as ce:
 			raise PlayStoreException("Could not not connect to store: {}".format(str(ce)))
-		except json.JSONDecodeError:
-			raise PlayStoreException("Could not parse search query response")
-		except IndexError:
-			return []
 
-		apps += [app[12][0] for app in data[0][1][0][0][0]][:amount]
+		# Some queries return a promenent result
+		try:
+			first_result = WebsiteMappings.find_item_from_json_mapping(result, WebsiteMappings.query_mapping['first_result'])
+		except (TypeError, IndexError):
+			try:
+				first_result = WebsiteMappings.find_item_from_json_mapping(result, WebsiteMappings.query_mapping['first_result_2'])
+			except (TypeError, IndexError):
+				# Could not identify first result
+				first_result = None
 
+		if first_result:
+			apps.append(first_result.split(WebsiteMappings.app_detail_link_subdomain)[1])
+			# Collect blocks of apps from promenent result page
+			try:
+				try:
+					app_list = WebsiteMappings.find_item_from_json_mapping(result, WebsiteMappings.query_mapping['list_of_apps'])
+				except (TypeError, IndexError):
+					# Second generic mapping found... depends on country
+					app_list = WebsiteMappings.find_item_from_json_mapping(result, WebsiteMappings.query_mapping['list_of_apps_2'])
+			except Exception as e:
+				raise PlayStoreException('Generic query failed for country %s url %s: %s' % (country, url, str(e)))
+		else:
+			# Collect blocks of apps from generic results page
+			try:
+				try:
+					app_list = WebsiteMappings.find_item_from_json_mapping(result, WebsiteMappings.query_mapping['list_of_apps_generic'])
+				except (TypeError, IndexError):
+					# Second generic mapping found... depends on country
+					app_list = WebsiteMappings.find_item_from_json_mapping(result, WebsiteMappings.query_mapping['list_of_apps_generic_2'])
+			except Exception as e:
+				raise PlayStoreException('Generic query failed for country %s url %s: %s' % (country, url, str(e)))
+			# Check if results are comprehensive
+			potential_results = len(self.extract_all_app_ids_from_page(result))
+			if not potential_results == len(app_list):
+				self._log_error(country, 'App Query Warning: Results (%i) do not equal potential results (%i)' % (len(app_list), potential_results))
+				# TODO how to warn user?
+
+		for app in app_list:
+			# Collect app id from each block
+			apps.append(WebsiteMappings.get_nested_item(app, WebsiteMappings.query_mapping['app_id_in_list']))
+
+		return apps[:amount]
+
+		# 2022-06-01 Google redesign and unsure how to reimpliment token
+		# They are using an infiniate scroll as opposed to pagination
+		# Prior implementation below:
 		# part two
 		# not all apps are loaded on the page initially, so we need to make
 		# subsequent requests via the internal API to request the additional
 		# apps. This request payload was borrowed from google-play-scraper.
 		body = '[[["qnKhOb","[[null,[[10,[10,50]],true,null,[96,27,4,8,57,30,110,79,11,16,49,1,3,9,12,104,55,56,51,10,34,77]],null,\\"%token%\\"]]",null,"generic"]]]'
-		token = data[0][1][0][0][7][1] if data[0][1][0][0][7] else None
+		try:
+			data = WebsiteMappings.extract_json_block(result, "ds:3")
+			data = json.loads(data)
+			token = data[0][1][0][0][7][1] if data[0][1][0][0][7] else None
+		except json.JSONDecodeError:
+			token = None
+			self._log_error(country,
+				PlayStoreException("json.JSONDecodeError: unable to obtain token for additional results"))
+		except IndexError:
+			token = None
+			self._log_error(country,
+				PlayStoreException("Index error: unable to obtain token for additional results"))
 
 		url = self.PLAYSTORE_URL + "/_/PlayStoreUi/data/batchexecute?rpcids=qnKhOb&bl=boq_playuiserver_20190424.04_p0"
 		url += "&hl=" + lang
@@ -129,7 +191,7 @@ class PlayStoreScraper:
 
 		try:
 			result = requests.get(url).text
-			block = self.extract_json_block(result, "ds:3")
+			block = WebsiteMappings.extract_json_block(result, "ds:3")
 			data = json.loads(block)
 		except (json.JSONDecodeError, PlayStoreException):
 			raise PlayStoreException("Could not parse Play Store response")
@@ -151,8 +213,10 @@ class PlayStoreScraper:
 		try:
 			developer_id = int(developer_id)
 			url = self.PLAYSTORE_URL + "/store/apps/dev?id="
+			normal_dev_layout = False
 		except ValueError:
 			url = self.PLAYSTORE_URL + "/store/apps/developer?id="
+			normal_dev_layout = True
 
 		url += quote_plus(str(developer_id))
 
@@ -161,12 +225,35 @@ class PlayStoreScraper:
 
 		try:
 			result = requests.get(url).text
-			data = self.extract_json_block(result, "ds:3")
-			data = json.loads(data)
-		except (json.JSONDecodeError, PlayStoreException):
-			raise PlayStoreException("Could not parse Play Store response")
+		except ConnectionError as ce:
+			raise PlayStoreException("Could not not connect to store: {}".format(str(ce)))
 
-		return [app[12][0] for app in data[0][1][0][0][0]]
+		# Collect all potential app IDs on page
+		potential_apps = self.extract_all_app_ids_from_page(result)
+
+		try:
+			# Collects specific results from JSON object
+			if normal_dev_layout:
+				app_list = WebsiteMappings.find_item_from_json_mapping(result, WebsiteMappings.query_mapping['list_of_apps_developer'])
+			else:
+				app_list = WebsiteMappings.find_item_from_json_mapping(result, WebsiteMappings.query_mapping[
+					'list_of_apps_developer_id'])
+		except Exception as e:
+			raise PlayStoreException('Generic query failed for country %s url %s: %s' % (country, url, str(e)))
+
+		# These normal dev pages only seem to have the specific apps we are looking for (as opposed to other results with "similar apps" or "app you might be interesed in"
+		if not len(potential_apps) == len(app_list):
+			self._log_error(country, 'App Query Warning: Results (%i) do not equal potential results (%i)' % (len(app_list), len(potential_apps)))
+			# TODO how to warn user?
+
+		# Collect app IDs from app_list
+		if normal_dev_layout:
+			apps = [WebsiteMappings.get_nested_item(app, WebsiteMappings.query_mapping['app_id_in_list']) for app in app_list]
+		else:
+			apps = [WebsiteMappings.get_nested_item(app, WebsiteMappings.query_mapping['app_id_in_list_dev_id']) for app in app_list]
+
+		return apps[:num]
+
 
 	def get_similar_app_ids_for_app(self, app_id, country="nl", lang="nl"):
 		"""
@@ -183,32 +270,35 @@ class PlayStoreScraper:
 
 		:return list:  List of similar app IDs
 		"""
-		url = self.PLAYSTORE_URL + "/store/apps/details?id="
+		url = self.PLAYSTORE_URL + WebsiteMappings.app_detail_link_subdomain
 		url += quote_plus(app_id)
 
 		url += "&hl=" + lang
 		url += "&gl=" + country
 
-		try:
-			result = requests.get(url).text
-			data = self.extract_json_block(result, WebsiteMappings.app_details['similar_apps'])
-			data = json.loads(data)
-			similar_url = self.PLAYSTORE_URL + data[1][1][0][0][3][4][2]
-		except (json.JSONDecodeError, PlayStoreException):
-			raise PlayStoreException("Could not parse Play Store response")
+		result = requests.get(url).text
+		soup = BeautifulSoup(result, 'html.parser')
+
+		# Check for collection links; there is currently only one to the similar apps
+		possible_collections = [link.get('href') for link in soup.find_all('a') if WebsiteMappings.collection_subdomain in link.get('href')]
+		if len(possible_collections) > 1:
+			raise PlayStoreException("Similar apps link criteria changed; unable to find link to similar apps!")
+		elif len(possible_collections) == 0:
+			raise PlayStoreException("No similar apps link found; check if similar apps link exists at link and inform developers if necessary: %s" % url)
+
+		similar_url = self.PLAYSTORE_URL + possible_collections[0]
 
 		try:
 			result = requests.get(similar_url).text
-			data = self.extract_json_block(result, "ds:3")
-			result = json.loads(data)
-		except json.JSONDecodeError:
-			pass
+		except ConnectionError as ce:
+			raise PlayStoreException("Could not not connect to store: {}".format(str(ce)))
 
-		return [app[12][0] for app in result[0][1][0][0][0]]
+		return self.extract_all_app_ids_from_page(result)
 
 	def get_permissions_for_app(self, app_id, lang="en", short=True):
 		"""
 		Get a list of permissions for a given app
+		TODO: What is this URL?
 
 		:param string app_id:  Play ID to get permissions for
 		:param string lang:  Language, defaults to 'en'. Parts of the
@@ -256,31 +346,6 @@ class PlayStoreScraper:
 
 		return result
 
-	def _app_connection (self, url, sleeptime=0, retry=0) :
-		"""
-			Extracted method for app connection
-
-			:param string url : The URL to query
-		"""
-		if sleeptime > 0:
-			time.sleep(sleeptime)
-
-		try:
-			result = requests.get(url).text
-		except ConnectionError:
-			raise PlayStoreException("Could not connect to : {0}".format(url))
-
-		try:
-			pricing = json.loads(self.extract_json_block(result, WebsiteMappings.app_details['pricing']))
-			info = json.loads(self.extract_json_block(result, WebsiteMappings.app_details['info']))
-			version = json.loads(self.extract_json_block(result, WebsiteMappings.app_details['version']))
-			pegi = json.loads(self.extract_json_block(result, WebsiteMappings.app_details['pegi']))
-			rating = json.loads(self.extract_json_block(result, WebsiteMappings.app_details['rating']))
-		except json.JSONDecodeError as je:
-			raise PlayStoreException(str(je))
-
-		return pricing, info, version, pegi, rating
-
 	def get_app_details(self, app_id, country="nl", lang="nl"):
 		"""
 		Get app details for given app ID
@@ -298,48 +363,49 @@ class PlayStoreScraper:
 		url += "&hl=" + lang
 		url += "&gl=" + country
 
-		try:
-			pricing, info, version, pegi, rating = self._app_connection(url)
-
-		except (json.JSONDecodeError, PlayStoreException):
-			try:
-				# If we fail first, retry after a sleep.
-				# Fail if we cannot get a connection or data
-				pricing, info, version, pegi, rating = self._app_connection(url, sleeptime=2)
-			except:
-				raise PlayStoreException("Could not parse Play Store response for {0}".format(app_id))
+		request_result = self._app_connection(url, retry=1)
 
 		app = {
-			"img_src": info[0][12][1][3][2],
-			"title": info[0][0][0],
-			"link": url,
-			"id": app_id,
-			"developer_link": self.PLAYSTORE_URL + info[0][12][5][5][4][2],
-			"developer_name": info[0][12][5][1],
-			"description": info[0][10][0][1],
-			"price_inapp": info[0][12][12][0] if info[0][12][12] else "",
-			"category": info[0][12][25],
-			"num_downloads": info[0][12][9][2],
-			"num_downloads_approx": info[0][12][9][1],
-			"published": datetime.datetime.fromtimestamp(int(info[0][12][8][0])).strftime("%c"),
-			"published_timestamp": info[0][12][8][0],
-			"pegi": pegi[1][2][9][0],
-			"filesize": version[0],
-			"os": version[2],
-			"software": version[1],
-			"price": "%i %s" % (pricing[0][2][0][0][0][1][0][0], pricing[0][2][0][0][0][1][0][1]) if pricing[0][
-				2] else 0
+			'id': app_id,
+			'link': url,
 		}
+		for k, v in WebsiteMappings.app_details_mapping.items():
+			try:
+				app[k] = WebsiteMappings.find_item_from_json_mapping(request_result, v)
+			except PlayStoreException:
+				raise PlayStoreException("Could not parse Play Store response for {0}".format(app_id))
+			except Exception as e:
+				self._log_error(country, 'App Detail error for %s on detail %s: %s' % (app_id, k, str(e)))
+				if 'errors' in app.keys():
+					app['errors'].append(k)
+				else:
+					app['errors'] = [k]
 
-		try:
-			app["rating"] = rating[0][6][0][1] # rating[0][0][0][7][0][1]
-		except TypeError:
-			app["rating"] = 0
-		except Exception:
-			#slight catch all but lets store the error
-			self._log_error(country, 
-				PlayStoreException("Index error in rating for {0}".format(app_id)))
-			app["rating"] = 0
+		# Clean up any app details here
+		if app.get('developer_link'):
+			app['developer_link'] = self.PLAYSTORE_URL + app['developer_link']
+		if app.get('category'):
+			app['category'] = app['category'].replace('/store/apps/category/', '')
+
+		if app.get('data_safety_list'):
+			try:
+				app['data_safety_list'] = ', '.join([item[1] for item in app['data_safety_list']])
+			except IndexError:
+				pass
+
+		# Any special details needing BeautifulSoup
+		soup = BeautifulSoup(request_result, 'html.parser')
+		# List of categories
+		list_of_categories = ', '.join([', '.join([category.text for category in element.find_all('span')]) for element in soup.find_all('div', {'class': 'Uc6QCc'})])
+		if list_of_categories:
+			app['list_of_categories'] = list_of_categories
+		else:
+			app['errors'] = app.get('errors', []) + ['list_of_categories']
+
+		# Make errors print/csv friendly
+		if 'errors' in app.keys():
+			plural = 's' if len(app['errors']) > 1 else ''
+			app['errors'] = 'Detail%s not found for key%s: %s' % (plural, plural, ', '.join(app['errors']))
 
 		return app
 
@@ -347,7 +413,7 @@ class PlayStoreScraper:
 		"""
 		Get app details for a list of app IDs
 
-		:param list app_id:  Play IDs to retrieve details for
+		:param list app_ids:  Play IDs to retrieve details for
 		:param str country:  Two-letter country code of store to search in,
 		                     default 'nl'
 		:param str lang:  Language code to search with, default 'nl'
@@ -365,47 +431,36 @@ class PlayStoreScraper:
 				self._log_error(country, e)
 				continue
 
-	def extract_json_block(self, html, block_id):
+	def _app_connection(self, url, sleeptime=2, retry=0):
 		"""
-		Extract a block of JSON data from a Play Store page source code
+			Extracted method for app connection
 
-		Blocks of JSON with scrapeable data are embedded in the source code of
-		Google Play Store pages in a predictable way, so we can extract them
-		in a predictable way too. They are defined using a JavaScript function
-		called 'AF_initDataCallBack' (though sometimes capitalised differently)
-		which takes a function returning the JSON as one of its arguments. This
-		method extracts that function argument from the JavaScript source code.
-
-		:param str html:  HTML to extract JSON block from
-		:param str block_id: ID of the block, e.g. 'ds:3'
-		:return str:  JSON (unparsed) for that block ID
+			:param string url : The URL to query
 		"""
-		prefix = re.compile(r"AF_init[dD]ata[cC]all[bB]ack\s*\({[^{}]*key:\s*'" + re.escape(block_id) + ".*?data:")
-		suffix = re.compile(r"}\s*\)\s*;")
-
 		try:
-			block = prefix.split(html)[1]
-			block = suffix.split(block)[0]
-		except IndexError:
-			raise PlayStoreException("Could not extract block %s" % block_id)
-
-		block = block.strip()
-		block = re.sub(r"^function\s*\([^)]*\)\s*{", "", block)
-		block = re.sub("}$", "", block)
-		block = re.sub(r", sideChannel: {$", "", block)
-
-		return block
+			return requests.get(url).text
+		except ConnectionError:
+			if retry > 0:
+				if sleeptime > 0:
+					time.sleep(sleeptime)
+				retry = retry - 1
+				self._app_connection(url, sleeptime=sleeptime, retry=retry)
+			else:
+				raise PlayStoreException("Could not connect to : {0}".format(url))
 
 	def _log_error(self, app_store_country, message):
 		"""
-		Write the error to a local file to capture the error. 
+		Write the error to a local file to capture the error.
 
-			:param str app_store_country: the country for the app store
-			:param str message: the error message to log
-
+		:param str app_store_country: the country for the app store
+		:param str message: the error message to log
 		"""
-		app_log = "{0}_log.txt".format(app_store_country)
-		errortime = datetime.datetime.now().strftime('%Y%m%d_%H:%M:%S - ')
+		log_dir = 'log/'
+		if not os.path.isdir(log_dir):
+			os.mkdir(log_dir)
+
+		app_log = os.path.join(log_dir, "{0}_log.txt".format(app_store_country))
+		errortime = datetime.now().strftime('%Y%m%d_%H:%M:%S - ')
 		fh = open(app_log, "a")
-		fh.write("%s %s \n" % (errortime, message))
+		fh.write("%s %s \n" % (errortime,message))
 		fh.close()

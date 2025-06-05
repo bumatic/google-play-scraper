@@ -5,7 +5,7 @@ with open("README.md", "r") as fh:
 
 setuptools.setup(
     name="google-play-scraper-dmi",
-    version="0.9.9",
+    version="0.9.17",
     author="Digital Methods Initiative",
     author_email="stijn.peeters@uva.nl",
     description="A lightweight Google Play Store scraper",
@@ -19,5 +19,5 @@ setuptools.setup(
         "Operating System :: OS Independent",
     ],
     python_requires='>=3.6',
-    install_requires = ['requests'],
+    install_requires = ['requests', 'beautifulsoup4>=4.9.3'],
 )
